@@ -143,7 +143,7 @@ A **tokoro coroutine** must contain at least two elements:
 
 Below is a minimal example:
 ```C++
-Async<int> Sqaure(int value) 
+Async<int> Square(int value) 
 {
     co_await tokoro::Wait();
     co_return value * value;
