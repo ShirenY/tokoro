@@ -343,7 +343,7 @@ Handle<Mesh> handle1 = GlobalScheduler().Start(LoadMesh, mesh1);
 Handle<Mesh> handle2 = GlobalScheduler().Start(LoadMesh, mesh2);
 // You can probably co_await WaitWhile([&](){return handle1.IsRunning() || handle2.IsRunning()});
 // But this is just a example.
-auto [handle1Finished, handle2Finished] = co_await All(WaitWhile([&](){return handle1.IsRunning()}), WaitWhile([&](){return handle2.IsRunning()}));
+auto [handle1Finished, handle2Finished] = co_await Any(WaitWhile([&](){return handle1.IsRunning()}), WaitWhile([&](){return handle2.IsRunning()}));
 
 if(handle1Finished.has_value())
 {
