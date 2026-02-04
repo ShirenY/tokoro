@@ -1,4 +1,4 @@
-#include "tokoro.h"
+﻿#include "tokoro.h"
 #include <cassert>
 #include <iostream>
 #include <source_location>
@@ -269,34 +269,316 @@ void TestGlobalScheduler()
     std::cout << "TestGlobalScheduler passed\n";
 }
 
-template <typename T>
-struct TmplTester
+// A test to make sure no extra object constructed or copied.
+//
+class LifeTimeChecker
 {
-    void Check()
+public:
+    std::string name;
+
+    inline static int ConstructCount = 0;
+    inline static int CopyCount = 0;
+    inline static int MoveCount = 0;
+    inline static int CopyAssignCount = 0;
+    inline static int MoveAssignCount = 0;
+    inline static int DestructCount = 0;
+
+    static void ClearCounts()
     {
-        if constexpr (!std::is_same<T, int>::value)
+        ConstructCount = 0;
+        CopyCount = 0;
+        MoveCount = 0;
+        CopyAssignCount = 0;
+        MoveAssignCount = 0;
+        DestructCount = 0;
+    }
+
+    static bool IsBalanced()
+    {
+        return (ConstructCount + CopyCount + MoveCount ) == DestructCount;
+    }
+
+    // LCOV_EXCL_START This function should never be used. Prepared for incorrect construction.
+    LifeTimeChecker(const std::source_location& location = std::source_location::current())
+        : name("default")
+    {
+        ++ConstructCount;
+        log("Default Constructor", location);
+    }
+    // LCOV_EXCL_STOP
+
+    LifeTimeChecker(const std::string& n, const std::source_location& location = std::source_location::current())
+        : name(n)
+    {
+        ++ConstructCount;
+        log("Custom Constructor", location);
+    }
+
+    LifeTimeChecker(const LifeTimeChecker& other,
+        const std::source_location& location = std::source_location::current())
+        : name(other.name + "-c")
+    {
+        ++CopyCount;
+        log("Copy Constructor", location);
+    }
+
+    LifeTimeChecker(LifeTimeChecker&& other,
+        const std::source_location& location = std::source_location::current()) noexcept
+        : name(std::move(other.name))
+    {
+        ++MoveCount;
+        log("Move Constructor", location);
+    }
+
+    LifeTimeChecker& operator=(const LifeTimeChecker& other)
+    {
+        ++CopyAssignCount;
+        log("Copy Assignment", std::source_location::current());
+        if (this != &other)
         {
-            assert(false);
+            name = other.name + "-c";
         }
+        return *this;
+    }
+
+    LifeTimeChecker& operator=(LifeTimeChecker&& other) noexcept
+    {
+        ++MoveAssignCount;
+        log("Move Assignment", std::source_location::current());
+        if (this != &other)
+        {
+            name = std::move(other.name);
+        }
+        return *this;
+    }
+
+    ~LifeTimeChecker()
+    {
+        ++DestructCount;
+        log("Destructor", std::source_location::current());
+    }
+
+private:
+    void log(const std::string& action, const std::source_location& location) const
+    {
+        // std::cout << "[" << action << "] "
+        //           << "Object: " << name << " | "
+        //           << "At: " << location.file_name() << ":" << location.line()
+        //           << " in " << location.function_name() << "\n";
     }
 };
 
-// Test only to make sure the move/copy constructor works.
-void TestTmplAnyMove()
+
+// Tests for TrustMeAny
+//
+
+using Any32 = internal::TrustMeAny<32>;
+
+void Test_Basic_POD()
 {
-    internal::TmplAny<TmplTester> A = TmplTester<int>();
-    internal::TmplAny<TmplTester> B = TmplTester<int>();
+    std::cout << "[Test] Basic POD Types... ";
+    Any32 a = 100;
+    assert(a.HasValue());
+    assert(*a.Cast<int>() == 100);
 
-    internal::TmplAny<TmplTester> test(std::move(A));
-    test.WithTmplArg<int>().Check();
+    *a.Cast<int>() = 200;
+    assert(*a.Cast<int>() == 200);
 
-    test = std::move(B);
-    test.WithTmplArg<int>().Check();
+    // Assign different type of value.
+    a = 3.14;
+    assert(*a.Cast<double>() == 3.14);
 
-    internal::TmplAny<TmplTester> test2(test);
-    test2.WithTmplArg<int>().Check();
+    std::cout << "OK\n";
+}
 
-    std::cout << "TestTmplAnyMove passed\n";
+void Test_SSO_Lifecycle()
+{
+    std::cout << "[Test] SSO Lifecycle (Stack Allocation)... ";
+    LifeTimeChecker::ClearCounts();
+
+    {
+        Any32 a = LifeTimeChecker("Hello");
+        assert(LifeTimeChecker::ConstructCount == 1);
+        // Construct count depends on compiler optimization (RVO/Copy Elision)。
+        // Check the internal value
+
+        LifeTimeChecker* t = a.Cast<LifeTimeChecker>();
+        assert(t != nullptr);
+        assert(t->name == "Hello");
+    } // A destructed
+
+    assert(LifeTimeChecker::IsBalanced());
+    std::cout << "OK\n";
+}
+
+void Test_Heap_Lifecycle()
+{
+    std::cout << "[Test] Heap Lifecycle (Large Object)... ";
+    LifeTimeChecker::ClearCounts();
+
+    // Define a struct bigger than 32
+    struct BigStruct
+    {
+        char data[100];
+        LifeTimeChecker t;
+        BigStruct(const std::string& name) : t(name) {}
+    };
+
+    static_assert(sizeof(BigStruct) > 32, "Struct must be larger than SSO buffer");
+
+    {
+        Any32 a = BigStruct("Hello heap");
+        assert(a.Cast<BigStruct>()->t.name == "Hello heap");
+    } // a destructed
+
+    assert(LifeTimeChecker::IsBalanced());
+    std::cout << "OK\n";
+}
+
+void Test_Copy_Semantics()
+{
+    std::cout << "[Test] Copy Semantics... ";
+    LifeTimeChecker::ClearCounts();
+
+    {
+        Any32 a = LifeTimeChecker("Hello 1");
+        Any32 b = a; // Trigger Copy Construct
+
+        // Verify deep copy
+        assert(a.Cast<LifeTimeChecker>()->name == "Hello 1");
+        assert(b.Cast<LifeTimeChecker>()->name == "Hello 1-c");
+        assert(a.Cast<LifeTimeChecker>() != b.Cast<LifeTimeChecker>()); // Different address
+
+        // Change copy does not affect origin instance.
+        b.Cast<LifeTimeChecker>()->name = "Hello 2";
+        assert(a.Cast<LifeTimeChecker>()->name == "Hello 1");
+        assert(b.Cast<LifeTimeChecker>()->name == "Hello 2");
+    }
+
+    assert(LifeTimeChecker::IsBalanced());
+    std::cout << "OK\n";
+}
+
+void Test_Move_Semantics()
+{
+    std::cout << "[Test] Move Semantics... ";
+    LifeTimeChecker::ClearCounts();
+
+    {
+        Any32 a = LifeTimeChecker("42");
+        Any32 b = std::move(a); // Trigger Move Construct
+
+        // b should hold value
+        assert(b.HasValue());
+        assert(b.Cast<LifeTimeChecker>()->name == "42");
+
+        // a should be empty
+        assert(!a.HasValue());
+        assert(a.Cast<LifeTimeChecker>() == nullptr);
+    }
+
+    assert(LifeTimeChecker::IsBalanced());
+    std::cout << "OK\n";
+}
+
+void Test_Assignment_Reset()
+{
+    std::cout << "[Test] Assignment & Reset... ";
+    LifeTimeChecker::ClearCounts();
+
+    {
+        Any32 a = LifeTimeChecker("1");
+        Any32 b = LifeTimeChecker("2");
+
+        a = b; // Copy Assignment: a's 1 destructed，copy b(2)
+
+        assert(a.Cast<LifeTimeChecker>()->name == "2-c");
+        assert(b.Cast<LifeTimeChecker>()->name == "2");
+
+        a.Reset();
+        assert(!a.HasValue());
+        assert(b.HasValue()); // b still exist
+    }
+
+    assert(LifeTimeChecker::IsBalanced());
+    std::cout << "OK\n";
+}
+
+void Test_InPlace_Construction()
+{
+    std::cout << "[Test] In-Place Construction... ";
+    LifeTimeChecker::ClearCounts();
+
+    {
+        Any32 a(std::in_place_type<LifeTimeChecker>, "123");
+
+        assert(a.HasValue());
+        assert(a.Cast<LifeTimeChecker>()->name == "123");
+
+        // In-place should have one less move. move/copy
+        assert(LifeTimeChecker::ConstructCount == 1);
+    }
+
+    assert(LifeTimeChecker::IsBalanced());
+    std::cout << "OK\n";
+}
+
+void Test_Standard_Complex_Types()
+{
+    std::cout << "[Test] std::string & std::vector... ";
+
+    // Test String (SSO usually works for small strings, heap for long)
+    {
+        Any32 s_any = std::string("Hello World");
+        assert(*s_any.Cast<std::string>() == "Hello World");
+
+        // Append
+        s_any.Cast<std::string>()->append("!");
+        assert(*s_any.Cast<std::string>() == "Hello World!");
+    }
+
+    // Test Vector
+    {
+        std::vector<int> vec = { 1, 2, 3 };
+        Any32 v_any = std::move(vec); // Move vector into Any
+
+        assert(v_any.Cast<std::vector<int>>()->size() == 3);
+        assert(v_any.Cast<std::vector<int>>()->at(2) == 3);
+    }
+
+    std::cout << "OK\n";
+}
+
+// Show incorrect operation of TrustMeAny
+void Test_The_TrustMe_Danger()
+{
+    std::cout << "[Test] The 'Trust Me' Behavior (Check output manually)... ";
+
+    Any32 a = 123456789; // int
+
+    // Incorrect cast type of a, but no error will report.
+    double* d = a.Cast<double>();
+    assert(d != nullptr);
+
+    // std::cout << "Int as double: " << *d << std::endl; 
+    std::cout << "OK (No crash)\n";
+}
+
+void TestTrustMeAny()
+{
+    std::cout << "=== Running TrustMeAny Tests ===\n\n";
+
+    Test_Basic_POD();
+    Test_SSO_Lifecycle();
+    Test_Heap_Lifecycle();
+    Test_Copy_Semantics();
+    Test_Move_Semantics();
+    Test_Assignment_Reset();
+    Test_InPlace_Construction();
+    Test_Standard_Complex_Types();
+    Test_The_TrustMe_Danger();
+
+    std::cout << "\n=== All TrustMeAny Tests Passed ===\n\n";
 }
 
 // TestCustomUpdateAndTimers
@@ -760,102 +1042,10 @@ void TestMemberCoroutines()
     std::cout << "TestMemberCoroutines passed\n";
 }
 
-// A test to make sure no extra object constructed or copied.
-//
-class LifeTimeChecker
-{
-public:
-    std::string name;
-
-    inline static int ConstructCount  = 0;
-    inline static int CopyCount       = 0;
-    inline static int MoveCount       = 0;
-    inline static int CopyAssignCount = 0;
-    inline static int MoveAssignCount = 0;
-    inline static int DestructCount   = 0;
-
-    static void ClearCounts()
-    {
-        ConstructCount  = 0;
-        CopyCount       = 0;
-        MoveCount       = 0;
-        CopyAssignCount = 0;
-        MoveAssignCount = 0;
-        DestructCount   = 0;
-    }
-
-    // LCOV_EXCL_START This function should never be used. Prepared for incorrect construction.
-    LifeTimeChecker(const std::source_location& location = std::source_location::current())
-        : name("default")
-    {
-        ++ConstructCount;
-        log("Default Constructor", location);
-    }
-    // LCOV_EXCL_STOP
-
-    LifeTimeChecker(const std::string& n, const std::source_location& location = std::source_location::current())
-        : name(n)
-    {
-        ++ConstructCount;
-        log("Custom Constructor", location);
-    }
-
-    LifeTimeChecker(const LifeTimeChecker&      other,
-                    const std::source_location& location = std::source_location::current())
-        : name(other.name + "-c")
-    {
-        ++CopyCount;
-        log("Copy Constructor", location);
-    }
-
-    LifeTimeChecker(LifeTimeChecker&&           other,
-                    const std::source_location& location = std::source_location::current()) noexcept
-        : name(std::move(other.name))
-    {
-        ++MoveCount;
-        log("Move Constructor", location);
-    }
-
-    LifeTimeChecker& operator=(const LifeTimeChecker& other)
-    {
-        ++CopyAssignCount;
-        log("Copy Assignment", std::source_location::current());
-        if (this != &other)
-        {
-            name = other.name + "-c";
-        }
-        return *this;
-    }
-
-    LifeTimeChecker& operator=(LifeTimeChecker&& other) noexcept
-    {
-        ++MoveAssignCount;
-        log("Move Assignment", std::source_location::current());
-        if (this != &other)
-        {
-            name = std::move(other.name);
-        }
-        return *this;
-    }
-
-    ~LifeTimeChecker()
-    {
-        ++DestructCount;
-        log("Destructor", std::source_location::current());
-    }
-
-private:
-    void log(const std::string& action, const std::source_location& location) const
-    {
-        // std::cout << "[" << action << "] "
-        //           << "Object: " << name << " | "
-        //           << "At: " << location.file_name() << ":" << location.line()
-        //           << " in " << location.function_name() << "\n";
-    }
-};
-
 void TestReturnObjLifetime()
 {
+    LifeTimeChecker::ClearCounts();
+
     auto handle = GlobalScheduler().Start([]() -> Async<LifeTimeChecker> {
         co_return LifeTimeChecker("A");
     });
@@ -1019,6 +1209,8 @@ void StressTest(size_t count)
 
 int main()
 {
+    TestTrustMeAny();
+
     TestSingleAwaitValue();
     TestSingleAwaitVoid();
     TestAllCombinator();
@@ -1028,7 +1220,6 @@ int main()
     TestUseHandleAfterSchedulerDestroyed();
     TestStartInCoroutine();
     TestGlobalScheduler();
-    TestTmplAnyMove();
     TestCustomUpdateAndTimers();
     TestWaitUntilAndWhile();
     TestThrowException();

@@ -4,9 +4,8 @@
 #include "internal/promise.h"
 #include "internal/singleawaiter.h"
 #include "internal/timequeue.h"
-#include "internal/tmplany.h"
+#include "internal/trustme_any.h"
 
-#include <any>
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -241,7 +240,7 @@ public:
         // Create the Coro<T>
         newEntry.coro = newEntry.lambda();
 
-        Async<RetType>& newCoro = newEntry.coro.WithTmplArg<RetType>();
+        Async<RetType>& newCoro = *newEntry.coro.Cast<Async<RetType>>();
         newCoro.SetId(id);
         newCoro.SetCoroManager(this);
 
@@ -334,12 +333,12 @@ private:
     std::optional<T> TakeResult(uint64_t id)
     {
         auto& entry = mCoroutines[id];
-        if (!entry.coro)
+        if (!entry.coro.HasValue())
             return std::nullopt;
 
         auto      coro   = std::move(entry.coro);
-        Async<T>& asyncT = coro.WithTmplArg<T>();
-        return std::move(asyncT.GetCppHandle().promise().TakeResult());
+        Async<T>* asyncT = coro.Cast<Async<T>>();
+        return std::move(asyncT->GetCppHandle().promise().TakeResult());
     }
 
     template <typename T>
@@ -347,12 +346,12 @@ private:
     void TakeResult(uint64_t id)
     {
         auto& entry = mCoroutines[id];
-        if (!entry.coro)
+        if (!entry.coro.HasValue())
             return;
 
         auto         coro   = std::move(entry.coro);
-        Async<void>& asyncT = coro.WithTmplArg<void>();
-        asyncT.GetCppHandle().promise().TakeResult();
+        Async<void>* asyncT = coro.Cast<Async<void>>();
+        asyncT->GetCppHandle().promise().TakeResult();
     }
 
     void OnCoroutineFinished(uint64_t id, bool isSucceed)
@@ -371,8 +370,11 @@ private:
 
     struct Entry
     {
-        TmplAny<Async>                  coro;
-        std::function<TmplAny<Async>()> lambda;
+        // Size of Async<T> are always the same independent of T.
+        typedef TrustMeAny<sizeof(Async<void>), alignof(Async<void>)> AsyncAny;
+
+        AsyncAny                        coro;
+        std::function<AsyncAny()>       lambda;
         AsyncState                      state    = AsyncState::Running;
         bool                            released = false;
     };
