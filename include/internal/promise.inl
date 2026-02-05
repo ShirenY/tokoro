@@ -116,7 +116,7 @@ template <typename T>
 T Promise<T>::TakeResult()
 {
     RethrowIfAny();
-    return std::move(*this->mReturnValue.Cast<T>());
+    return std::move(*this->mReturnValue.Get<T>());
 }
 
 // Promise<void> functions

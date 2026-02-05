@@ -7,12 +7,14 @@
 #include <cstddef> // for std::max_align_t
 #include <new> // std::launder
 #include <string_view>
+#include <cstdint>
 
 // ============================================================
 // SizedAny<Size, Align>
 // A std::any alternative:
 // - Does not depend on RTTI,
 // - Customizable SSO size.
+// - Does not support copy. (Because tokoro need support move only types.)
 //
 // Params:
 //  - Size:  SSO buffer size
@@ -82,7 +84,6 @@ class SizedAny {
 
     struct VTable {
         void (*destroy)(SizedAny*);
-        void (*copy)(const SizedAny*, SizedAny*);
         void (*move)(SizedAny*, SizedAny*);
         TypeId id;
     };
@@ -93,23 +94,14 @@ class SizedAny {
                                      std::is_nothrow_move_constructible_v<T>; // So that move constructor can be noexcept
 
 public:
+    // SizedAny is not copyable
+    SizedAny(const SizedAny&) = delete;
+    SizedAny& operator=(const SizedAny&) = delete;
+
     SizedAny() = default;
 
     ~SizedAny() {
         Reset();
-    }
-
-    SizedAny(const SizedAny& other) {
-        if (other.vptr_) {
-            if (!other.vptr_->copy) {
-                assert(false && "Attempting to copy a Move-only SizedAny");
-                vptr_ = nullptr;
-            }
-            else {
-                other.vptr_->copy(&other, this);
-                vptr_ = other.vptr_;
-            }
-        }
     }
 
     SizedAny(SizedAny&& other) noexcept
@@ -122,7 +114,8 @@ public:
     }
 
     template <typename T, typename Decayed = std::decay_t<T>>
-    SizedAny(T&& value) requires (!std::is_same_v<Decayed, SizedAny>)
+    SizedAny(T&& value)
+        requires (!std::is_same_v<Decayed, SizedAny> && !std::is_same_v<Decayed, std::in_place_type_t<Decayed>>)
     {
         this->template emplace<Decayed>(std::forward<T>(value));
     }
@@ -131,17 +124,6 @@ public:
     template <class T, class... Args>
     explicit SizedAny(std::in_place_type_t<T>, Args&&... args) {
         emplace<T>(std::forward<Args>(args)...);
-    }
-
-    SizedAny& operator=(const SizedAny& other)
-    {
-        if (this != &other) 
-        {
-            // Strong Exception Guarantee via Swap-like logic
-            SizedAny tmp(other); // May throw, but `this` is untouched
-            *this = std::move(tmp); // Move assign (usually safe)
-        }
-        return *this;
     }
 
     SizedAny& operator=(SizedAny&& other) noexcept {
@@ -176,9 +158,7 @@ public:
     }
 
     template <class T>
-    T* Cast() noexcept {
-        if (!vptr_) return nullptr;
-
+    T* Get() noexcept {
         if (!IsType<T>())
             return nullptr;
 
@@ -191,9 +171,7 @@ public:
     }
 
     template <class T>
-    const T* Cast() const noexcept {
-        if (!vptr_) return nullptr;
-
+    const T* Get() const noexcept {
         if (!IsType<T>())
             return nullptr;
 
@@ -239,19 +217,6 @@ private:
     }
 
     template <class U>
-    static void copy_impl(const SizedAny* src, SizedAny* dst) {
-        if constexpr (std::is_copy_constructible_v<U>) {
-            if constexpr (kIsStack<U>) {
-                new (&dst->buffer_) U(
-                    *reinterpret_cast<const U*>(&src->buffer_));
-            }
-            else {
-                dst->heap_ptr_ = new U(*static_cast<U*>(src->heap_ptr_));
-            }
-        }
-    }
-
-    template <class U>
     static void move_impl(SizedAny* src, SizedAny* dst) {
         if constexpr (kIsStack<U>) {
             new (&dst->buffer_) U(
@@ -275,7 +240,6 @@ template <class U>
 const typename SizedAny<Size, Align>::VTable
 SizedAny<Size, Align>::vtable_for = {
     &SizedAny<Size, Align>::template destroy_impl<U>,
-    std::is_copy_constructible_v<U> ? &SizedAny::copy_impl<U> : nullptr,
     &SizedAny<Size, Align>::template move_impl<U>,
     GetTypeId<U>()
 };

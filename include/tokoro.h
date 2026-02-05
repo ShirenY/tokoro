@@ -240,7 +240,7 @@ public:
         // Create the Coro<T>
         newEntry.coro = newEntry.lambda();
 
-        Async<RetType>& newCoro = *newEntry.coro.Cast<Async<RetType>>();
+        Async<RetType>& newCoro = *newEntry.coro.Get<Async<RetType>>();
         newCoro.SetId(id);
         newCoro.SetCoroManager(this);
 
@@ -337,7 +337,7 @@ private:
             return std::nullopt;
 
         auto      coro   = std::move(entry.coro);
-        Async<T>* asyncT = coro.Cast<Async<T>>();
+        Async<T>* asyncT = coro.Get<Async<T>>();
         return std::move(asyncT->GetCppHandle().promise().TakeResult());
     }
 
@@ -350,7 +350,7 @@ private:
             return;
 
         auto         coro   = std::move(entry.coro);
-        Async<void>* asyncT = coro.Cast<Async<void>>();
+        Async<void>* asyncT = coro.Get<Async<void>>();
         asyncT->GetCppHandle().promise().TakeResult();
     }
 

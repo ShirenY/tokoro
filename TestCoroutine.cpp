@@ -379,14 +379,14 @@ void Test_Basic_POD()
     std::cout << "[Test] Basic POD Types... ";
     Any32 a = 100;
     assert(a.HasValue());
-    assert(*a.Cast<int>() == 100);
+    assert(*a.Get<int>() == 100);
 
-    *a.Cast<int>() = 200;
-    assert(*a.Cast<int>() == 200);
+    *a.Get<int>() = 200;
+    assert(*a.Get<int>() == 200);
 
     // Assign different type of value.
     a = 3.14;
-    assert(*a.Cast<double>() == 3.14);
+    assert(*a.Get<double>() == 3.14);
 
     std::cout << "OK\n";
 }
@@ -402,7 +402,7 @@ void Test_SSO_Lifecycle()
         // Construct count depends on compiler optimization (RVO/Copy Elision)。
         // Check the internal value
 
-        LifeTimeChecker* t = a.Cast<LifeTimeChecker>();
+        LifeTimeChecker* t = a.Get<LifeTimeChecker>();
         assert(t != nullptr);
         assert(t->name == "Hello");
     } // A destructed
@@ -428,32 +428,8 @@ void Test_Heap_Lifecycle()
 
     {
         Any32 a = BigStruct("Hello heap");
-        assert(a.Cast<BigStruct>()->t.name == "Hello heap");
+        assert(a.Get<BigStruct>()->t.name == "Hello heap");
     } // a destructed
-
-    assert(LifeTimeChecker::IsBalanced());
-    std::cout << "OK\n";
-}
-
-void Test_Copy_Semantics()
-{
-    std::cout << "[Test] Copy Semantics... ";
-    LifeTimeChecker::ClearCounts();
-
-    {
-        Any32 a = LifeTimeChecker("Hello 1");
-        Any32 b = a; // Trigger Copy Construct
-
-        // Verify deep copy
-        assert(a.Cast<LifeTimeChecker>()->name == "Hello 1");
-        assert(b.Cast<LifeTimeChecker>()->name == "Hello 1-c");
-        assert(a.Cast<LifeTimeChecker>() != b.Cast<LifeTimeChecker>()); // Different address
-
-        // Change copy does not affect origin instance.
-        b.Cast<LifeTimeChecker>()->name = "Hello 2";
-        assert(a.Cast<LifeTimeChecker>()->name == "Hello 1");
-        assert(b.Cast<LifeTimeChecker>()->name == "Hello 2");
-    }
 
     assert(LifeTimeChecker::IsBalanced());
     std::cout << "OK\n";
@@ -470,11 +446,11 @@ void Test_Move_Semantics()
 
         // b should hold value
         assert(b.HasValue());
-        assert(b.Cast<LifeTimeChecker>()->name == "42");
+        assert(b.Get<LifeTimeChecker>()->name == "42");
 
         // a should be empty
         assert(!a.HasValue());
-        assert(a.Cast<LifeTimeChecker>() == nullptr);
+        assert(a.Get<LifeTimeChecker>() == nullptr);
     }
 
     assert(LifeTimeChecker::IsBalanced());
@@ -488,16 +464,10 @@ void Test_Assignment_Reset()
 
     {
         Any32 a = LifeTimeChecker("1");
-        Any32 b = LifeTimeChecker("2");
-
-        a = b; // Copy Assignment: a's 1 destructed，copy b(2)
-
-        assert(a.Cast<LifeTimeChecker>()->name == "2-c");
-        assert(b.Cast<LifeTimeChecker>()->name == "2");
+        assert(a.Get<LifeTimeChecker>()->name == "1");
 
         a.Reset();
         assert(!a.HasValue());
-        assert(b.HasValue()); // b still exist
     }
 
     assert(LifeTimeChecker::IsBalanced());
@@ -513,7 +483,7 @@ void Test_InPlace_Construction()
         Any32 a(std::in_place_type<LifeTimeChecker>, "123");
 
         assert(a.HasValue());
-        assert(a.Cast<LifeTimeChecker>()->name == "123");
+        assert(a.Get<LifeTimeChecker>()->name == "123");
 
         // In-place should have one less move. move/copy
         assert(LifeTimeChecker::ConstructCount == 1);
@@ -530,11 +500,11 @@ void Test_Standard_Complex_Types()
     // Test String (SSO usually works for small strings, heap for long)
     {
         Any32 s_any = std::string("Hello World");
-        assert(*s_any.Cast<std::string>() == "Hello World");
+        assert(*s_any.Get<std::string>() == "Hello World");
 
         // Append
-        s_any.Cast<std::string>()->append("!");
-        assert(*s_any.Cast<std::string>() == "Hello World!");
+        s_any.Get<std::string>()->append("!");
+        assert(*s_any.Get<std::string>() == "Hello World!");
     }
 
     // Test Vector
@@ -542,8 +512,8 @@ void Test_Standard_Complex_Types()
         std::vector<int> vec = { 1, 2, 3 };
         Any32 v_any = std::move(vec); // Move vector into Any
 
-        assert(v_any.Cast<std::vector<int>>()->size() == 3);
-        assert(v_any.Cast<std::vector<int>>()->at(2) == 3);
+        assert(v_any.Get<std::vector<int>>()->size() == 3);
+        assert(v_any.Get<std::vector<int>>()->at(2) == 3);
     }
 
     std::cout << "OK\n";
@@ -556,12 +526,12 @@ void Test_TypeCheck()
 
     Any32 a = 123456789; // int
 
-    double* d = a.Cast<double>();
+    double* d = a.Get<double>();
     assert(d == nullptr);
     assert(a.IsType<int>());
 
     a = std::string("test");
-    std::string* pStr = a.Cast<std::string>();
+    std::string* pStr = a.Get<std::string>();
     assert(pStr != nullptr);
     assert(!a.IsType<int>());
 
@@ -575,7 +545,6 @@ void TestSizedAny()
     Test_Basic_POD();
     Test_SSO_Lifecycle();
     Test_Heap_Lifecycle();
-    Test_Copy_Semantics();
     Test_Move_Semantics();
     Test_Assignment_Reset();
     Test_InPlace_Construction();
