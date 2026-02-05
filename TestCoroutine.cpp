@@ -369,10 +369,10 @@ private:
 };
 
 
-// Tests for TrustMeAny
+// Tests for SizedAny
 //
 
-using Any32 = internal::TrustMeAny<32>;
+using Any32 = internal::SizedAny<32>;
 
 void Test_Basic_POD()
 {
@@ -549,24 +549,28 @@ void Test_Standard_Complex_Types()
     std::cout << "OK\n";
 }
 
-// Show incorrect operation of TrustMeAny
-void Test_The_TrustMe_Danger()
+// Show incorrect operation of SizedAny
+void Test_TypeCheck()
 {
     std::cout << "[Test] The 'Trust Me' Behavior (Check output manually)... ";
 
     Any32 a = 123456789; // int
 
-    // Incorrect cast type of a, but no error will report.
     double* d = a.Cast<double>();
-    assert(d != nullptr);
+    assert(d == nullptr);
+    assert(a.IsType<int>());
 
-    // std::cout << "Int as double: " << *d << std::endl; 
-    std::cout << "OK (No crash)\n";
+    a = std::string("test");
+    std::string* pStr = a.Cast<std::string>();
+    assert(pStr != nullptr);
+    assert(!a.IsType<int>());
+
+    std::cout << "OK\n";
 }
 
-void TestTrustMeAny()
+void TestSizedAny()
 {
-    std::cout << "=== Running TrustMeAny Tests ===\n\n";
+    std::cout << "=== Running SizedAny Tests ===\n\n";
 
     Test_Basic_POD();
     Test_SSO_Lifecycle();
@@ -576,9 +580,9 @@ void TestTrustMeAny()
     Test_Assignment_Reset();
     Test_InPlace_Construction();
     Test_Standard_Complex_Types();
-    Test_The_TrustMe_Danger();
+    Test_TypeCheck();
 
-    std::cout << "\n=== All TrustMeAny Tests Passed ===\n\n";
+    std::cout << "\n=== All SizedAny Tests Passed ===\n\n";
 }
 
 // TestCustomUpdateAndTimers
@@ -1209,7 +1213,7 @@ void StressTest(size_t count)
 
 int main()
 {
-    TestTrustMeAny();
+    TestSizedAny();
 
     TestSingleAwaitValue();
     TestSingleAwaitVoid();

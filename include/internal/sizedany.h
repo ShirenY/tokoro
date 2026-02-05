@@ -6,9 +6,15 @@
 #include <cassert>
 #include <cstddef> // for std::max_align_t
 #include <new> // std::launder
+#include <string_view>
 
 // ============================================================
-// TrustMeAny<Size, Align>
+// SizedAny<Size, Align>
+// A std::any alternative:
+// - Does not depend on RTTI,
+// - Customizable SSO size.
+//
+// Params:
 //  - Size:  SSO buffer size
 //  - Align: SSO buffer alignment (default: max_align_t)
 // ============================================================
@@ -16,8 +22,55 @@
 namespace tokoro::internal
 {
 
+template <typename T>
+constexpr std::string_view TypeName() {
+#if defined(__clang__) || defined(__GNUC__)
+    return __PRETTY_FUNCTION__;
+#elif defined(_MSVC_LANG)
+    return __FUNCSIG__;
+#endif
+}
+
+constexpr uint64_t fnv1a_hash(std::string_view str) {
+    uint64_t hash = 14695981039346656037ULL; // Offset Basis
+    const uint64_t prime = 1099511628211ULL; // Prime
+
+    for (char c : str) {
+        hash ^= static_cast<uint8_t>(c);
+        hash *= prime;
+    }
+    return hash;
+}
+
+// TypeId is based on hash of __PRETTY_FUNCTION__
+// So it's not reliable cross-compilers.
+struct TypeId {
+    uint64_t hash;
+#ifndef NDEBUG
+    std::string_view name; // Only used in dev for hash collision detection
+#endif
+    bool operator==(const TypeId& other) const {
+        if (hash != other.hash) return false;
+#ifndef NDEBUG
+        assert(name == other.name && "Hash collision detected! Consider change the type name.");
+#endif
+        return true;
+    }
+};
+
+template <typename T>
+constexpr TypeId GetTypeId() {
+    auto name = TypeName<T>();
+    return TypeId{
+        fnv1a_hash(name),
+#ifndef NDEBUG
+        name
+#endif
+    };
+}
+
 template <std::size_t Size, std::size_t Align = alignof(std::max_align_t)>
-class TrustMeAny {
+class SizedAny {
     static_assert(Size > 0);
     static_assert((Align& (Align - 1)) == 0, "Align must be a power of 2");
     static_assert(Align <= alignof(std::max_align_t),
@@ -28,25 +81,28 @@ class TrustMeAny {
     };
 
     struct VTable {
-        void (*destroy)(TrustMeAny*);
-        void (*copy)(const TrustMeAny*, TrustMeAny*);
-        void (*move)(TrustMeAny*, TrustMeAny*);
+        void (*destroy)(SizedAny*);
+        void (*copy)(const SizedAny*, SizedAny*);
+        void (*move)(SizedAny*, SizedAny*);
+        TypeId id;
     };
 
     template <typename T>
-    static constexpr bool kIsStack = sizeof(T) <= Size && alignof(T) <= Align;
+    static constexpr bool kIsStack = sizeof(T) <= Size && 
+                                     alignof(T) <= Align &&
+                                     std::is_nothrow_move_constructible_v<T>; // So that move constructor can be noexcept
 
 public:
-    TrustMeAny() = default;
+    SizedAny() = default;
 
-    ~TrustMeAny() {
+    ~SizedAny() {
         Reset();
     }
 
-    TrustMeAny(const TrustMeAny& other) {
+    SizedAny(const SizedAny& other) {
         if (other.vptr_) {
             if (!other.vptr_->copy) {
-                assert(false && "Attempting to copy a Move-only TrustMeAny");
+                assert(false && "Attempting to copy a Move-only SizedAny");
                 vptr_ = nullptr;
             }
             else {
@@ -56,7 +112,8 @@ public:
         }
     }
 
-    TrustMeAny(TrustMeAny&& other) {
+    SizedAny(SizedAny&& other) noexcept
+    {
         if (other.vptr_) {
             other.vptr_->move(&other, this);
             vptr_ = other.vptr_;
@@ -65,29 +122,29 @@ public:
     }
 
     template <typename T, typename Decayed = std::decay_t<T>>
-    TrustMeAny(T&& value) requires (!std::is_same_v<Decayed, TrustMeAny>)
+    SizedAny(T&& value) requires (!std::is_same_v<Decayed, SizedAny>)
     {
-        this->emplace<Decayed>(std::forward<T>(value));
+        this->template emplace<Decayed>(std::forward<T>(value));
     }
 
     // Support in_place construction
     template <class T, class... Args>
-    explicit TrustMeAny(std::in_place_type_t<T>, Args&&... args) {
+    explicit SizedAny(std::in_place_type_t<T>, Args&&... args) {
         emplace<T>(std::forward<Args>(args)...);
     }
 
-    TrustMeAny& operator=(const TrustMeAny& other)
+    SizedAny& operator=(const SizedAny& other)
     {
         if (this != &other) 
         {
             // Strong Exception Guarantee via Swap-like logic
-            TrustMeAny tmp(other); // May throw, but `this` is untouched
+            SizedAny tmp(other); // May throw, but `this` is untouched
             *this = std::move(tmp); // Move assign (usually safe)
         }
         return *this;
     }
 
-    TrustMeAny& operator=(TrustMeAny&& other) noexcept {
+    SizedAny& operator=(SizedAny&& other) noexcept {
         if (this == &other) return *this;
         Reset();
         if (other.vptr_) {
@@ -97,6 +154,63 @@ public:
         }
         return *this;
     }
+
+    bool HasValue() const noexcept {
+        return vptr_ != nullptr;
+    }
+
+    void Reset() noexcept {
+        if (vptr_) {
+            vptr_->destroy(this);
+            vptr_ = nullptr;
+        }
+    }
+
+    template <class T>
+    bool IsType() const
+    {
+        if (vptr_ == nullptr)
+            return false;
+
+        return GetTypeId<T>() == vptr_->id;
+    }
+
+    template <class T>
+    T* Cast() noexcept {
+        if (!vptr_) return nullptr;
+
+        if (!IsType<T>())
+            return nullptr;
+
+        if constexpr (kIsStack<T>) {
+            return std::launder(reinterpret_cast<T*>(&buffer_));
+        }
+        else {
+            return static_cast<T*>(heap_ptr_);
+        }
+    }
+
+    template <class T>
+    const T* Cast() const noexcept {
+        if (!vptr_) return nullptr;
+
+        if (!IsType<T>())
+            return nullptr;
+
+        if constexpr (kIsStack<T>) {
+            return std::launder(reinterpret_cast<const T*>(&buffer_));
+        }
+        else {
+            return static_cast<const T*>(heap_ptr_);
+        }
+    }
+
+private:
+    const VTable* vptr_ = nullptr;
+    union {
+        Buffer buffer_;
+        void* heap_ptr_;
+    };
 
     template <class T, class... Args>
     void emplace(Args&&... args) {
@@ -114,50 +228,8 @@ public:
         vptr_ = &vtable_for<U>;
     }
 
-    bool HasValue() const noexcept {
-        return vptr_ != nullptr;
-    }
-
-    void Reset() noexcept {
-        if (vptr_) {
-            vptr_->destroy(this);
-            vptr_ = nullptr;
-        }
-    }
-
-    template <class T>
-    T* Cast() noexcept {
-        if (!vptr_) return nullptr;
-        // TRUST ME: logic assumes T is correct.
-        if constexpr (kIsStack<T>) {
-            return std::launder(reinterpret_cast<T*>(&buffer_));
-        }
-        else {
-            return static_cast<T*>(heap_ptr_);
-        }
-    }
-
-    template <class T>
-    const T* Cast() const noexcept {
-        if (!vptr_) return nullptr;
-        if constexpr (kIsStack<T>) {
-            return std::launder(reinterpret_cast<const T*>(&buffer_));
-        }
-        else {
-            return static_cast<const T*>(heap_ptr_);
-        }
-    }
-
-private:
-    union {
-        Buffer buffer_;
-        void* heap_ptr_;
-    };
-
-    const VTable* vptr_ = nullptr;
-
     template <class U>
-    static void destroy_impl(TrustMeAny* self) {
+    static void destroy_impl(SizedAny* self) {
         if constexpr (kIsStack<U>) {
             reinterpret_cast<U*>(&self->buffer_)->~U();
         }
@@ -167,7 +239,7 @@ private:
     }
 
     template <class U>
-    static void copy_impl(const TrustMeAny* src, TrustMeAny* dst) {
+    static void copy_impl(const SizedAny* src, SizedAny* dst) {
         if constexpr (std::is_copy_constructible_v<U>) {
             if constexpr (kIsStack<U>) {
                 new (&dst->buffer_) U(
@@ -180,7 +252,7 @@ private:
     }
 
     template <class U>
-    static void move_impl(TrustMeAny* src, TrustMeAny* dst) {
+    static void move_impl(SizedAny* src, SizedAny* dst) {
         if constexpr (kIsStack<U>) {
             new (&dst->buffer_) U(
                 std::move(*reinterpret_cast<U*>(&src->buffer_)));
@@ -200,11 +272,12 @@ private:
 
 template <std::size_t Size, std::size_t Align>
 template <class U>
-const typename TrustMeAny<Size, Align>::VTable
-TrustMeAny<Size, Align>::vtable_for = {
-    &TrustMeAny<Size, Align>::template destroy_impl<U>,
-    std::is_copy_constructible_v<U> ? &TrustMeAny::copy_impl<U> : nullptr,
-    &TrustMeAny<Size, Align>::template move_impl<U>
+const typename SizedAny<Size, Align>::VTable
+SizedAny<Size, Align>::vtable_for = {
+    &SizedAny<Size, Align>::template destroy_impl<U>,
+    std::is_copy_constructible_v<U> ? &SizedAny::copy_impl<U> : nullptr,
+    &SizedAny<Size, Align>::template move_impl<U>,
+    GetTypeId<U>()
 };
 
 }

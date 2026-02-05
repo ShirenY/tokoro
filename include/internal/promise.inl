@@ -103,13 +103,13 @@ auto Promise<T>::get_return_object() noexcept
 template <typename T>
 void Promise<T>::return_value(T&& val)
 {
-    this->mReturnValue.template emplace<T>(std::forward<T>(val));
+    this->mReturnValue = std::forward<T>(val);
 }
 
 template <typename T>
 void Promise<T>::return_value(const T& val)
 {
-    this->mReturnValue.template emplace<T>(val);
+    this->mReturnValue = val;
 }
 
 template <typename T>

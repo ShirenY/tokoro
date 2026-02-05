@@ -1,7 +1,7 @@
 #pragma once
 
 #include "defines.h"
-#include "trustme_any.h"
+#include "sizedany.h"
 
 #include <coroutine>
 #include <exception>
@@ -40,7 +40,7 @@ protected:
     void RethrowIfAny();
 
     std::exception_ptr mException;
-    TrustMeAny<32>     mReturnValue;
+    SizedAny<32>     mReturnValue;
     uint64_t           mId            = 0;
     CoroAwaiterBase*   mParentAwaiter = nullptr;
     void*              mCoroManager   = nullptr;

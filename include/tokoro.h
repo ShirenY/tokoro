@@ -4,7 +4,7 @@
 #include "internal/promise.h"
 #include "internal/singleawaiter.h"
 #include "internal/timequeue.h"
-#include "internal/trustme_any.h"
+#include "internal/sizedany.h"
 
 #include <array>
 #include <cassert>
@@ -371,7 +371,7 @@ private:
     struct Entry
     {
         // Size of Async<T> are always the same independent of T.
-        typedef TrustMeAny<sizeof(Async<void>), alignof(Async<void>)> AsyncAny;
+        typedef SizedAny<sizeof(Async<void>), alignof(Async<void>)> AsyncAny;
 
         AsyncAny                        coro;
         std::function<AsyncAny()>       lambda;

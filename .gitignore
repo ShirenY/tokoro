@@ -17,3 +17,4 @@ code_coverage_clang/
 .vscode/
 TestCoroutine/
 x64/
+Test/
