@@ -2,10 +2,9 @@
 
 #include <type_traits>
 #include <utility>
-#include <new>
+#include <new> // std::launder
 #include <cassert>
 #include <cstddef> // for std::max_align_t
-#include <new> // std::launder
 #include <string_view>
 #include <cstdint>
 
@@ -91,7 +90,8 @@ class SizedAny {
     template <typename T>
     static constexpr bool kIsStack = sizeof(T) <= Size && 
                                      alignof(T) <= Align &&
-                                     std::is_nothrow_move_constructible_v<T>; // So that move constructor can be noexcept
+                                     // To make move constructor noexcept. On heap objects only need copy the pointer.
+                                     std::is_nothrow_move_constructible_v<T>;
 
 public:
     // SizedAny is not copyable
@@ -163,7 +163,7 @@ public:
             return nullptr;
 
         if constexpr (kIsStack<T>) {
-            return std::launder(reinterpret_cast<T*>(&buffer_));
+            return &stack_as<T>();
         }
         else {
             return static_cast<T*>(heap_ptr_);
@@ -176,7 +176,7 @@ public:
             return nullptr;
 
         if constexpr (kIsStack<T>) {
-            return std::launder(reinterpret_cast<const T*>(&buffer_));
+            return &stack_as<T>();
         }
         else {
             return static_cast<const T*>(heap_ptr_);
@@ -206,10 +206,24 @@ private:
         vptr_ = &vtable_for<U>;
     }
 
+    // helper to get raw pointer to stack storage
+    void* stack_ptr() noexcept { return static_cast<void*>(buffer_.data); }
+    const void* stack_ptr() const noexcept { return static_cast<const void*>(buffer_.data); }
+
+    template <class T>
+    T& stack_as() noexcept {
+        return *std::launder(reinterpret_cast<T*>(stack_ptr()));
+    }
+
+    template <class T>
+    const T& stack_as() const noexcept {
+        return *std::launder(reinterpret_cast<const T*>(stack_ptr()));
+    }
+
     template <class U>
     static void destroy_impl(SizedAny* self) {
         if constexpr (kIsStack<U>) {
-            reinterpret_cast<U*>(&self->buffer_)->~U();
+            self->stack_as<U>().~U();
         }
         else {
             delete static_cast<U*>(self->heap_ptr_);
@@ -219,9 +233,9 @@ private:
     template <class U>
     static void move_impl(SizedAny* src, SizedAny* dst) {
         if constexpr (kIsStack<U>) {
-            new (&dst->buffer_) U(
-                std::move(*reinterpret_cast<U*>(&src->buffer_)));
-            reinterpret_cast<U*>(&src->buffer_)->~U();
+            U& srcRef = src->stack_as<U>();
+            new (dst->stack_ptr()) U(std::move(srcRef));
+            srcRef.~U();
         }
         else {
             dst->heap_ptr_ = src->heap_ptr_;
