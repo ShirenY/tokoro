@@ -74,8 +74,6 @@ template <std::size_t Size, std::size_t Align = alignof(std::max_align_t)>
 class SizedAny {
     static_assert(Size > 0);
     static_assert((Align& (Align - 1)) == 0, "Align must be a power of 2");
-    static_assert(Align <= alignof(std::max_align_t),
-                  "Extended alignment not supported. Align must be <= alignof(std::max_align_t)");
 
     struct alignas(Align) Buffer {
         unsigned char data[Size];
@@ -154,7 +152,8 @@ public:
         if (vptr_ == nullptr)
             return false;
 
-        return GetTypeId<T>() == vptr_->id;
+        using U = std::decay_t<T>;
+        return GetTypeId<U>() == vptr_->id;
     }
 
     template <class T>
