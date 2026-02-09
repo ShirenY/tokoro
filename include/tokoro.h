@@ -4,7 +4,6 @@
 #include "internal/promise.h"
 #include "internal/singleawaiter.h"
 #include "internal/timequeue.h"
-#include "internal/sizedany.h"
 
 #include <array>
 #include <cassert>
@@ -129,6 +128,12 @@ class Any;
 template <typename... Ts>
 class All;
 
+template<typename RetType>
+std::coroutine_handle<internal::Promise<RetType>> toTypedHandle(std::coroutine_handle<> handle)
+{
+    return std::coroutine_handle<internal::Promise<RetType>>::from_address(handle.address());
+}
+
 template <typename T>
 class Async
 {
@@ -142,21 +147,9 @@ public:
     {
     }
 
-    Async(Async&& o)
-        : mHandle(o.mHandle)
-    {
-        o.mHandle = nullptr;
-    }
-
-    ~Async()
-    {
-        if (mHandle)
-            mHandle.destroy();
-    }
-
     auto operator co_await() noexcept
     {
-        return internal::SingleCoroAwaiter(GetCppHandle());
+        return internal::SingleCoroAwaiter(toTypedHandle<T>(mHandle));
     }
 
 private:
@@ -165,26 +158,6 @@ private:
     template <typename... Ts>
     friend class Any;
     friend class internal::CoroManager;
-
-    void SetId(uint64_t id)
-    {
-        GetCppHandle().promise().SetId(id);
-    }
-
-    void SetCoroManager(internal::CoroManager* coroMgr)
-    {
-        GetCppHandle().promise().SetCoroManager(coroMgr);
-    }
-
-    std::coroutine_handle<promise_type> GetCppHandle()
-    {
-        return std::coroutine_handle<promise_type>::from_address(mHandle.address());
-    }
-
-    void Resume()
-    {
-        mHandle.resume();
-    }
 
     std::coroutine_handle<> mHandle;
 };
@@ -234,18 +207,18 @@ public:
         // https://devblogs.microsoft.com/oldnewthing/20211103-00/?p=105870
         // <A capturing lambda can be a coroutine, but you have to save your captures while you still can>
         newEntry.lambda = [task = std::forward<AsyncFunc>(func), tup = std::make_tuple(std::forward<Args>(funcArgs)...)]() mutable {
-            return std::apply(task, tup);
+            return std::apply(task, tup).mHandle;
         };
 
         // Create the Coro<T>
-        newEntry.coro = newEntry.lambda();
+        newEntry.handle = newEntry.lambda();
 
-        Async<RetType>& newCoro = *newEntry.coro.Get<Async<RetType>>();
-        newCoro.SetId(id);
-        newCoro.SetCoroManager(this);
+        auto& promise = toTypedHandle<RetType>(newEntry.handle).promise();
+        promise.SetId(id);
+        promise.SetCoroManager(this);
 
         // Kick off the coroutine.
-        newCoro.Resume();
+        newEntry.handle.resume();
 
         // Check if the new coroutine already stopped running.
         StopNewFinishedCoro();
@@ -311,7 +284,8 @@ private:
         if (entry.state == AsyncState::Running)
         {
             entry.state = AsyncState::Stopped;
-            entry.coro.Reset(); // Remove the coro
+            entry.handle.destroy(); // Destroy the handle
+            entry.handle = nullptr;
             entry.lambda = {};  // Remove start lambda
         }
         else
@@ -333,12 +307,12 @@ private:
     std::optional<T> TakeResult(uint64_t id)
     {
         auto& entry = mCoroutines[id];
-        if (!entry.coro.HasValue())
+        if (entry.handle == nullptr)
             return std::nullopt;
 
-        auto      coro   = std::move(entry.coro);
-        Async<T>* asyncT = coro.Get<Async<T>>();
-        return std::move(asyncT->GetCppHandle().promise().TakeResult());
+        auto handle = entry.handle;
+        entry.handle = nullptr;
+        return std::move(toTypedHandle<T>(handle).promise().TakeResult());
     }
 
     template <typename T>
@@ -346,12 +320,10 @@ private:
     void TakeResult(uint64_t id)
     {
         auto& entry = mCoroutines[id];
-        if (!entry.coro.HasValue())
+        if (entry.handle == nullptr)
             return;
 
-        auto         coro   = std::move(entry.coro);
-        Async<void>* asyncT = coro.Get<Async<void>>();
-        asyncT->GetCppHandle().promise().TakeResult();
+        toTypedHandle<T>(entry.handle).promise().TakeResult();
     }
 
     void OnCoroutineFinished(uint64_t id, bool isSucceed)
@@ -370,13 +342,10 @@ private:
 
     struct Entry
     {
-        // Size of Async<T> are always the same independent of T.
-        typedef SizedAny<sizeof(Async<void>), alignof(Async<void>)> AsyncAny;
-
-        AsyncAny                        coro;
-        std::function<AsyncAny()>       lambda;
-        AsyncState                      state    = AsyncState::Running;
-        bool                            released = false;
+        std::coroutine_handle<>                  handle;
+        std::function<std::coroutine_handle<>()> lambda;
+        AsyncState                               state    = AsyncState::Running;
+        bool                                     released = false;
     };
 
     uint64_t                            mNextId = 1;
@@ -691,13 +660,13 @@ template <typename... Ts>
 class All : public internal::CoroAwaiterBase
 {
 private:
-    std::tuple<Async<Ts>...>                     mWaitedCoros;
-    std::size_t                                  mRemainingCount;
-    std::coroutine_handle<internal::PromiseBase> mParentHandle;
+    std::tuple<std::coroutine_handle<internal::Promise<Ts>>...> mWaitedHandles;
+    std::size_t                                                 mRemainingCount;
+    std::coroutine_handle<internal::PromiseBase>                mParentHandle;
 
 public:
     All(Async<Ts>&&... cs)
-        : mWaitedCoros(std::move(cs)...), mRemainingCount(sizeof...(Ts))
+        : mWaitedHandles(toTypedHandle<Ts>(cs.mHandle)...), mRemainingCount(sizeof...(Ts))
     {
     }
 
@@ -714,8 +683,7 @@ public:
         auto resumeWithIndexes = [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             (
                 [this] {
-                    auto& coro    = std::get<Is>(mWaitedCoros);
-                    auto  handle  = coro.GetCppHandle();
+                    auto& handle = std::get<Is>(mWaitedHandles);
                     auto& promise = handle.promise();
                     promise.SetCoroManager(mParentHandle.promise().GetCoroManager());
                     promise.SetParentAwaiter(this);
@@ -733,17 +701,18 @@ public:
 
         auto storeResults = [this, &results]<std::size_t... Is>(std::index_sequence<Is...>) {
             ([this, &results] {
-                auto& coro = std::get<Is>(mWaitedCoros);
+                auto& handle = std::get<Is>(mWaitedHandles);
                 using T    = std::tuple_element_t<Is, std::tuple<Ts...>>;
                 if constexpr (std::is_void_v<T>)
                 {
-                    coro.GetCppHandle().promise().TakeResult();
+                    handle.promise().TakeResult();
                     std::get<Is>(results) = std::monostate{};
                 }
                 else
                 {
-                    std::get<Is>(results) = std::move(coro.GetCppHandle().promise().TakeResult());
+                    std::get<Is>(results) = std::move(handle.promise().TakeResult());
                 }
+                handle.destroy();
             }(),
              ...);
         };
@@ -767,14 +736,14 @@ template <typename... Ts>
 class Any : public internal::CoroAwaiterBase
 {
 private:
-    std::optional<std::tuple<Async<Ts>...>>                mWaitedCoros;
-    std::coroutine_handle<>                                mFirstFinish;
-    std::tuple<std::optional<internal::RetConvert<Ts>>...> mResults;
-    std::coroutine_handle<internal::PromiseBase>           mParentHandle;
+    std::tuple<std::coroutine_handle<internal::Promise<Ts>>...> mWaitedHandles;
+    std::coroutine_handle<>                                     mFirstFinish;
+    std::tuple<std::optional<internal::RetConvert<Ts>>...>      mResults;
+    std::coroutine_handle<internal::PromiseBase>                mParentHandle;
 
 public:
     Any(Async<Ts>&&... cs)
-        : mWaitedCoros(std::tuple<Async<Ts>...>(std::move(cs)...)), mResults()
+        : mWaitedHandles(toTypedHandle<Ts>(cs.mHandle)...), mResults()
     {
     }
 
@@ -790,8 +759,7 @@ public:
 
         auto resumeWithIndexes = [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             ([this] {
-                auto& coro    = std::get<Is>(mWaitedCoros.value());
-                auto  handle  = coro.GetCppHandle();
+                auto& handle    = std::get<Is>(mWaitedHandles);
                 auto& promise = handle.promise();
                 promise.SetCoroManager(mParentHandle.promise().GetCoroManager());
                 promise.SetParentAwaiter(this);
@@ -806,27 +774,30 @@ public:
     {
         auto checkStoreWithIndexes = [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             ([this] {
-                auto& coro = std::get<Is>(mWaitedCoros.value());
-                if (coro.GetCppHandle().address() != mFirstFinish.address())
+                auto& handle = std::get<Is>(mWaitedHandles);
+                if (handle.address() != mFirstFinish.address())
+                {
+                    handle.destroy();
                     return;
+                }
 
                 using T = std::tuple_element_t<Is, std::tuple<Ts...>>;
                 if constexpr (std::is_void_v<T>)
                 {
                     // To trigger the exception if any
-                    coro.GetCppHandle().promise().TakeResult();
+                    handle.promise().TakeResult();
                     std::get<Is>(mResults) = std::monostate{};
                 }
                 else
                 {
-                    std::get<Is>(mResults) = std::move(coro.GetCppHandle().promise().TakeResult());
+                    std::get<Is>(mResults) = std::move(handle.promise().TakeResult());
                 }
+                handle.destroy();
             }(),
              ...);
         };
         checkStoreWithIndexes(std::index_sequence_for<Ts...>{});
 
-        mWaitedCoros.reset();
         return mResults;
     }
 

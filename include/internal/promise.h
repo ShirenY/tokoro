@@ -1,10 +1,10 @@
 #pragma once
 
 #include "defines.h"
-#include "sizedany.h"
 
 #include <coroutine>
 #include <exception>
+#include <optional>
 
 namespace tokoro
 {
@@ -40,7 +40,6 @@ protected:
     void RethrowIfAny();
 
     std::exception_ptr mException;
-    SizedAny<32>     mReturnValue;
     uint64_t           mId            = 0;
     CoroAwaiterBase*   mParentAwaiter = nullptr;
     void*              mCoroManager   = nullptr;
@@ -56,6 +55,9 @@ public:
     void return_value(T&& val);
     void return_value(const T& val);
     T    TakeResult();
+
+private:
+    std::optional<T>     mReturnValue;
 };
 
 template <>
