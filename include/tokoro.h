@@ -134,6 +134,9 @@ std::coroutine_handle<internal::Promise<RetType>> toTypedHandle(std::coroutine_h
     return std::coroutine_handle<internal::Promise<RetType>>::from_address(handle.address());
 }
 
+// Async<T> is the return value of every tokoro coroutine.
+// It's meanly used for RAII management of sub-coroutines, passing as awaiter.
+// You won't need to manipulate it directly as an end user.
 template <typename T>
 class Async
 {
@@ -142,9 +145,21 @@ public:
     using value_type   = T;
     using handle_type  = std::coroutine_handle<promise_type>;
 
-    Async(handle_type h)
+    Async(handle_type h) noexcept
         : mHandle(h)
     {
+    }
+
+    Async(Async&& o) noexcept
+        : mHandle(o.mHandle)
+    {
+        o.mHandle = nullptr;
+    }
+
+    ~Async()
+    {
+        if (mHandle)
+            mHandle.destroy();
     }
 
     auto operator co_await() noexcept
@@ -159,6 +174,23 @@ private:
     friend class Any;
     friend class internal::CoroManager;
 
+    // APIs for friends
+    //
+
+    // Takeover the lifetime of mHandle. This Async will become invalid.
+    std::coroutine_handle<> takeHandle()
+    {
+        auto handle = mHandle;
+        mHandle = nullptr;
+        return handle;
+    }
+
+    std::coroutine_handle<promise_type> getTypedHandle()
+    {
+        return std::coroutine_handle<promise_type>::from_address(mHandle.address());
+    }
+
+    // Even friends should not R\W to this member directly.
     std::coroutine_handle<> mHandle;
 };
 
@@ -207,7 +239,7 @@ public:
         // https://devblogs.microsoft.com/oldnewthing/20211103-00/?p=105870
         // <A capturing lambda can be a coroutine, but you have to save your captures while you still can>
         newEntry.lambda = [task = std::forward<AsyncFunc>(func), tup = std::make_tuple(std::forward<Args>(funcArgs)...)]() mutable {
-            return std::apply(task, tup).mHandle;
+            return std::apply(task, tup).takeHandle(); // For top coroutines, CoroManager will take over handle's lifetime management.
         };
 
         // Create the Coro<T>
@@ -660,13 +692,13 @@ template <typename... Ts>
 class All : public internal::CoroAwaiterBase
 {
 private:
-    std::tuple<std::coroutine_handle<internal::Promise<Ts>>...> mWaitedHandles;
-    std::size_t                                                 mRemainingCount;
-    std::coroutine_handle<internal::PromiseBase>                mParentHandle;
+    std::tuple<Async<Ts>...>                     mWaitedCoros;
+    std::size_t                                  mRemainingCount;
+    std::coroutine_handle<internal::PromiseBase> mParentHandle;
 
 public:
     All(Async<Ts>&&... cs)
-        : mWaitedHandles(toTypedHandle<Ts>(cs.mHandle)...), mRemainingCount(sizeof...(Ts))
+        : mWaitedCoros(std::move(cs)...), mRemainingCount(sizeof...(Ts))
     {
     }
 
@@ -683,7 +715,8 @@ public:
         auto resumeWithIndexes = [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             (
                 [this] {
-                    auto& handle = std::get<Is>(mWaitedHandles);
+                    auto& coro = std::get<Is>(mWaitedCoros);
+                    auto  handle = coro.getTypedHandle();
                     auto& promise = handle.promise();
                     promise.SetCoroManager(mParentHandle.promise().GetCoroManager());
                     promise.SetParentAwaiter(this);
@@ -701,18 +734,18 @@ public:
 
         auto storeResults = [this, &results]<std::size_t... Is>(std::index_sequence<Is...>) {
             ([this, &results] {
-                auto& handle = std::get<Is>(mWaitedHandles);
+                auto& coro = std::get<Is>(mWaitedCoros);
+                auto typedHandle = coro.getTypedHandle();
                 using T    = std::tuple_element_t<Is, std::tuple<Ts...>>;
                 if constexpr (std::is_void_v<T>)
                 {
-                    handle.promise().TakeResult();
+                    typedHandle.promise().TakeResult();
                     std::get<Is>(results) = std::monostate{};
                 }
                 else
                 {
-                    std::get<Is>(results) = std::move(handle.promise().TakeResult());
+                    std::get<Is>(results) = std::move(typedHandle.promise().TakeResult());
                 }
-                handle.destroy();
             }(),
              ...);
         };
@@ -736,14 +769,14 @@ template <typename... Ts>
 class Any : public internal::CoroAwaiterBase
 {
 private:
-    std::tuple<std::coroutine_handle<internal::Promise<Ts>>...> mWaitedHandles;
+    std::tuple<Async<Ts>...>                                    mWaitedCoros;
     std::coroutine_handle<>                                     mFirstFinish;
     std::tuple<std::optional<internal::RetConvert<Ts>>...>      mResults;
     std::coroutine_handle<internal::PromiseBase>                mParentHandle;
 
 public:
     Any(Async<Ts>&&... cs)
-        : mWaitedHandles(toTypedHandle<Ts>(cs.mHandle)...), mResults()
+        : mWaitedCoros(std::move(cs)...), mResults()
     {
     }
 
@@ -759,7 +792,8 @@ public:
 
         auto resumeWithIndexes = [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             ([this] {
-                auto& handle    = std::get<Is>(mWaitedHandles);
+                auto& coro    = std::get<Is>(mWaitedCoros);
+                auto handle = coro.getTypedHandle();
                 auto& promise = handle.promise();
                 promise.SetCoroManager(mParentHandle.promise().GetCoroManager());
                 promise.SetParentAwaiter(this);
@@ -774,12 +808,10 @@ public:
     {
         auto checkStoreWithIndexes = [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             ([this] {
-                auto& handle = std::get<Is>(mWaitedHandles);
+                auto& coro = std::get<Is>(mWaitedCoros);
+                auto handle = coro.getTypedHandle();
                 if (handle.address() != mFirstFinish.address())
-                {
-                    handle.destroy();
                     return;
-                }
 
                 using T = std::tuple_element_t<Is, std::tuple<Ts...>>;
                 if constexpr (std::is_void_v<T>)
@@ -792,7 +824,6 @@ public:
                 {
                     std::get<Is>(mResults) = std::move(handle.promise().TakeResult());
                 }
-                handle.destroy();
             }(),
              ...);
         };
