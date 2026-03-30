@@ -994,8 +994,53 @@ void StressTest(size_t count)
     std::cout << "TestStress(" << count << ") passed\n";
 }
 
+// Demonstrate use-after-free in Any::await_suspend when a non-last child completes synchronously.
+//
+// SyncValue() has no co_await, so it completes synchronously during handle.resume().
+// When Is=0 (the first child) finishes:
+//   1. OnWaitComplete returns mParentHandle → parent resumes via symmetric transfer
+//   2. Parent calls Any::await_resume() → Any is destroyed (~Any runs, mWaitedCoros freed)
+//   3. handle.resume() for Is=0 returns back to the fold loop
+//   4. Fold loop continues to Is=1 → accesses already-destroyed mWaitedCoros
+//
+// Expected log order that proves the bug:
+//   [Any@X] await_suspend: starting child Is=0
+//   [Any@X] OnWaitComplete: child done, resuming parent
+//   [Any@X] await_resume called
+//   [Any@X] ~Any DESTROYED          ← Any is gone
+//   [Any@X] await_suspend: child Is=0 handle.resume() returned   ← dangling this
+//   [Any@X] await_suspend: starting child Is=1                   ← UAF: accessing destroyed mWaitedCoros
+void TestAnySyncChildUAF()
+{
+    std::cout << "\n--- TestAnySyncChildUAF ---\n";
+
+    Scheduler sched;
+    bool      completed = false;
+
+    // A coroutine with no co_await: completes synchronously when resumed
+    auto SyncValue = [](int val) -> Async<int> {
+        co_return val;
+    };
+
+    auto h = sched.Start([&]() -> Async<void> {
+        // Is=0 (SyncValue(1)) will complete synchronously.
+        // If Any is destroyed before Is=1 is started, that is use-after-free.
+        auto [r0, r1] = co_await Any(SyncValue(1), SyncValue(2));
+        std::cout << "parent resumed: r0=" << r0.value_or(-1)
+                  << " r1=" << r1.value_or(-1) << "\n";
+        completed = true;
+    });
+
+    sched.Update();
+
+    std::cout << "completed=" << completed << "\n";
+    std::cout << "--- TestAnySyncChildUAF end ---\n\n";
+}
+
 int main()
 {
+    TestAnySyncChildUAF();
+
     TestSingleAwaitValue();
     TestSingleAwaitVoid();
     TestAllCombinator();

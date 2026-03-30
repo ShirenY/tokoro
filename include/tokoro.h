@@ -773,6 +773,7 @@ private:
     std::coroutine_handle<>                                     mFirstFinish;
     std::tuple<std::optional<internal::RetConvert<Ts>>...>      mResults;
     std::coroutine_handle<internal::PromiseBase>                mParentHandle;
+    bool                                                        mSuspended = false;
 
 public:
     Any(Async<Ts>&&... cs)
@@ -786,12 +787,14 @@ public:
     }
 
     template <typename T>
-    void await_suspend(std::coroutine_handle<internal::Promise<T>> h) noexcept
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<internal::Promise<T>> h) noexcept
     {
         mParentHandle = std::coroutine_handle<internal::PromiseBase>::from_address(h.address());
 
         auto resumeWithIndexes = [this]<std::size_t... Is>(std::index_sequence<Is...>) {
             ([this] {
+                if (mFirstFinish) 
+                    return; // A child already completed, skip remaining
                 auto& coro    = std::get<Is>(mWaitedCoros);
                 auto handle = coro.getTypedHandle();
                 auto& promise = handle.promise();
@@ -802,6 +805,12 @@ public:
              ...);
         };
         resumeWithIndexes(std::index_sequence_for<Ts...>{});
+
+        if (mFirstFinish)
+            return mParentHandle;
+
+        mSuspended = true;
+        return std::noop_coroutine();
     }
 
     auto await_resume()
@@ -835,7 +844,10 @@ public:
     std::coroutine_handle<> OnWaitComplete(std::coroutine_handle<> h) noexcept override
     {
         mFirstFinish = h;
-        return mParentHandle;
+        if (mSuspended)
+            return mParentHandle;
+        else
+            return std::noop_coroutine();
     }
 };
 
