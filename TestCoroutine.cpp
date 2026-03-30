@@ -2,6 +2,7 @@
 #include <cassert>
 #include <iostream>
 #include <source_location>
+#include <thread>
 #include <vector>
 
 using namespace tokoro;
@@ -1037,6 +1038,257 @@ void TestAnySyncChildUAF()
     std::cout << "--- TestAnySyncChildUAF end ---\n\n";
 }
 
+// ---------- Callback Awaiter Tests ----------
+
+void TestCallbackVoid()
+{
+    std::cout << "--- TestCallbackVoid ---\n";
+    Scheduler sched;
+    bool completed = false;
+
+    Callback<>::Sender sender;
+
+    auto h = sched.Start([&]() -> Async<void> {
+        Callback<> cb;
+        sender = cb.GetSender();
+        co_await cb;
+        completed = true;
+    });
+
+    sched.Update();
+    assert(!completed && "Should not complete before Send()");
+
+    sender.Send();
+
+    // Send() pushes to lock-free stack, but coroutine resumes on next Update()
+    assert(!completed && "Should not complete before Update()");
+
+    sched.Update();
+    assert(completed && "Should complete after Update()");
+
+    std::cout << "--- TestCallbackVoid passed ---\n\n";
+}
+
+void TestCallbackValue()
+{
+    std::cout << "--- TestCallbackValue ---\n";
+    Scheduler sched;
+    int result = 0;
+    bool completed = false;
+
+    Callback<int>::Sender sender;
+
+    auto h = sched.Start([&]() -> Async<void> {
+        Callback<int> cb;
+        sender = cb.GetSender();
+        result = co_await cb;
+        completed = true;
+    });
+
+    sched.Update();
+    assert(!completed);
+
+    sender.Send(42);
+    sched.Update();
+
+    assert(completed);
+    assert(result == 42);
+
+    std::cout << "--- TestCallbackValue passed ---\n\n";
+}
+
+void TestCallbackFromThread()
+{
+    std::cout << "--- TestCallbackFromThread ---\n";
+    Scheduler sched;
+    int result = 0;
+    bool completed = false;
+
+    Callback<int>::Sender sender;
+
+    auto h = sched.Start([&]() -> Async<void> {
+        Callback<int> cb;
+        sender = cb.GetSender();
+        result = co_await cb;
+        completed = true;
+    });
+
+    sched.Update(); // kick off coroutine, it suspends at co_await cb
+
+    std::thread worker([sender]() {
+        sender.Send(99);
+    });
+    worker.join();
+
+    assert(!completed && "Should not resume until Update()");
+
+    sched.Update();
+    assert(completed);
+    assert(result == 99);
+
+    std::cout << "--- TestCallbackFromThread passed ---\n\n";
+}
+
+void TestCallbackStopBeforeSend()
+{
+    std::cout << "--- TestCallbackStopBeforeSend ---\n";
+    Scheduler sched;
+
+    Callback<int>::Sender sender;
+
+    {
+        auto h = sched.Start([&]() -> Async<void> {
+            Callback<int> cb;
+            sender = cb.GetSender();
+            co_await cb;
+            assert(false && "Should not reach here");
+        });
+
+        sched.Update(); // coroutine suspends at co_await cb
+
+        // h goes out of scope -> coroutine stopped -> ~CallbackBP runs
+    }
+
+    // Send after coroutine is destroyed — should be harmless
+    sender.Send(123);
+
+    // Update should not crash
+    sched.Update();
+
+    std::cout << "--- TestCallbackStopBeforeSend passed ---\n\n";
+}
+
+void TestCallbackSignalBeforeAwait()
+{
+    std::cout << "--- TestCallbackSignalBeforeAwait ---\n";
+    Scheduler sched;
+    int result = 0;
+    bool completed = false;
+
+    auto h = sched.Start([&]() -> Async<void> {
+        Callback<int> cb;
+        auto sender = cb.GetSender();
+        sender.Send(77); // Signal before co_await
+        result = co_await cb; // await_ready() returns true, no suspend
+        completed = true;
+    });
+
+    // The coroutine should complete synchronously (await_ready returns true)
+    // after the initial Start() kick-off
+    assert(completed);
+    assert(result == 77);
+
+    std::cout << "--- TestCallbackSignalBeforeAwait passed ---\n\n";
+}
+
+void TestCallbackWithAllCombinator()
+{
+    std::cout << "--- TestCallbackWithAllCombinator ---\n";
+    Scheduler sched;
+    bool completed = false;
+    int r1 = 0, r2 = 0;
+
+    Callback<int>::Sender sender1;
+    Callback<int>::Sender sender2;
+
+    auto h = sched.Start([&]() -> Async<void> {
+        auto [v1, v2] = co_await All(
+            [&]() -> Async<int> {
+                Callback<int> cb;
+                sender1 = cb.GetSender();
+                co_return co_await cb;
+            }(),
+            [&]() -> Async<int> {
+                Callback<int> cb;
+                sender2 = cb.GetSender();
+                co_return co_await cb;
+            }()
+        );
+        r1 = v1;
+        r2 = v2;
+        completed = true;
+    });
+
+    sched.Update();
+    assert(!completed);
+
+    sender1.Send(10);
+    sched.Update();
+    assert(!completed && "All should wait for both");
+
+    sender2.Send(20);
+    sched.Update();
+    assert(completed);
+    assert(r1 == 10 && r2 == 20);
+
+    std::cout << "--- TestCallbackWithAllCombinator passed ---\n\n";
+}
+
+void TestCallbackWithAnyCombinator()
+{
+    std::cout << "--- TestCallbackWithAnyCombinator ---\n";
+    Scheduler sched;
+    bool completed = false;
+
+    Callback<int>::Sender sender1;
+    Callback<int>::Sender sender2;
+
+    auto h = sched.Start([&]() -> Async<void> {
+        auto [v1, v2] = co_await Any(
+            [&]() -> Async<int> {
+                Callback<int> cb;
+                sender1 = cb.GetSender();
+                co_return co_await cb;
+            }(),
+            [&]() -> Async<int> {
+                Callback<int> cb;
+                sender2 = cb.GetSender();
+                co_return co_await cb;
+            }()
+        );
+        assert(v1.has_value() && *v1 == 55);
+        assert(!v2.has_value());
+        completed = true;
+    });
+
+    sched.Update();
+    assert(!completed);
+
+    sender1.Send(55);
+    sched.Update();
+    assert(completed);
+
+    // sender2 should be harmless after Any stopped the second coroutine
+    sender2.Send(66);
+    sched.Update(); // should not crash
+
+    std::cout << "--- TestCallbackWithAnyCombinator passed ---\n\n";
+}
+
+void TestCallbackSchedulerDestroyed()
+{
+    std::cout << "--- TestCallbackSchedulerDestroyed ---\n";
+
+    Callback<int>::Sender sender;
+
+    {
+        Scheduler sched;
+        auto h = sched.Start([&]() -> Async<void> {
+            Callback<int> cb;
+            sender = cb.GetSender();
+            co_await cb;
+        });
+
+        sched.Update();
+        // sched destroyed here
+    }
+
+    // Send after scheduler destroyed — should be harmless
+    sender.Send(42);
+
+    std::cout << "--- TestCallbackSchedulerDestroyed passed ---\n\n";
+}
+
 int main()
 {
     TestAnySyncChildUAF();
@@ -1058,6 +1310,15 @@ int main()
     TestReturnObjLifetime();
 
     StressTest(20000);
+
+    TestCallbackVoid();
+    TestCallbackValue();
+    TestCallbackFromThread();
+    TestCallbackStopBeforeSend();
+    TestCallbackSignalBeforeAwait();
+    TestCallbackWithAllCombinator();
+    TestCallbackWithAnyCombinator();
+    TestCallbackSchedulerDestroyed();
 
     std::cout << "All tests passed successfully." << std::endl;
     return 0;

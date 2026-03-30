@@ -4,20 +4,26 @@
 #include "internal/promise.h"
 #include "internal/singleawaiter.h"
 #include "internal/timequeue.h"
+#include "internal/callbackawaiter.h"
 
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <coroutine>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace tokoro
 {
 
 template <internal::CountEnum UpdateEnum, internal::CountEnum TimeEnum>
 class SchedulerBP;
+
+template <internal::CountEnum UpdateEnum, internal::CountEnum TimeEnum, typename T = void>
+class CallbackBP;
 
 template <internal::CountEnum UpdateEnum, internal::CountEnum TimeEnum>
 class WaitBP
@@ -394,7 +400,10 @@ class SchedulerBP : public internal::CoroManager
 {
 public:
     // Scheduler is neither copyable or movable.
-    SchedulerBP()                              = default;
+    SchedulerBP()
+        : mSignaledStack(std::make_shared<internal::SignaledStack>())
+    {
+    }
     SchedulerBP(const SchedulerBP&)            = delete;
     SchedulerBP& operator=(const SchedulerBP&) = delete;
     SchedulerBP(SchedulerBP&&)                 = delete;
@@ -410,6 +419,21 @@ public:
         {
             queue.Clear();
         }
+
+        // Drain any callback nodes pushed by concurrent Send() during/after ClearCoros()
+        auto* list = mSignaledStack->DrainAll();
+        while (list)
+        {
+            auto* next = list->next;
+            delete list;
+            list = next;
+        }
+        for (auto& bucket : mReadyBuckets)
+        {
+            for (auto* node : bucket)
+                delete node;
+            bucket.clear();
+        }
     }
 
     // SetCustomTimer: Set custom timer for specific time type to replace default realtime timer.
@@ -421,6 +445,30 @@ public:
     void Update(UpdateEnum updateType = UpdateEnum::Update,
                 TimeEnum   timeType   = TimeEnum::Realtime)
     {
+        // Drain lock-free stack into per-(updateType, timeType) buckets.
+        // Only nodes that have been signaled (via Sender::Send) appear here.
+        auto* list = mSignaledStack->DrainAll();
+        while (list)
+        {
+            auto* node = list;
+            list       = list->next;
+            mReadyBuckets[node->queueIndex].push_back(node);
+        }
+
+        // Process signaled callbacks for this (updateType, timeType) pair.
+        auto& bucket = mReadyBuckets[TypesToIndex(updateType, timeType)];
+        for (auto* node : bucket)
+        {
+            if (!node->state->cancelled.load(std::memory_order_acquire))
+            {
+                node->handle.resume();
+                CoroManager::StopNewFinishedCoro();
+            }
+            delete node;
+        }
+        bucket.clear();
+
+        // Process time queue (existing behavior).
         auto& timeQueue = GetUpdateQueue(updateType, timeType);
         timeQueue.SetupUpdate(GetCurrentTime(timeType));
 
@@ -436,11 +484,19 @@ private:
     using MyWait = WaitBP<UpdateEnum, TimeEnum>;
     friend MyWait;
 
+    template <internal::CountEnum U, internal::CountEnum T, typename V>
+    friend class CallbackBP;
+
     int TypesToIndex(UpdateEnum updateType, TimeEnum timeType)
     {
         const int updateIndex = static_cast<int>(updateType);
         const int timeIndex   = static_cast<int>(timeType);
         return updateIndex * static_cast<int>(TimeEnum::Count) + timeIndex;
+    }
+
+    const std::shared_ptr<internal::SignaledStack>& GetSignaledStack() const
+    {
+        return mSignaledStack;
     }
 
     internal::TimeQueue<MyWait*>& GetUpdateQueue(UpdateEnum updateType, TimeEnum timeType)
@@ -496,8 +552,10 @@ private:
 
     static constexpr int UpdateQueueCount = static_cast<int>(UpdateEnum::Count) * static_cast<int>(TimeEnum::Count);
 
-    std::array<internal::TimeQueue<MyWait*>, UpdateQueueCount>             mExecuteQueues;
-    std::array<std::function<double()>, static_cast<int>(TimeEnum::Count)> mCustomTimers;
+    std::array<internal::TimeQueue<MyWait*>, UpdateQueueCount>                mExecuteQueues;
+    std::array<std::function<double()>, static_cast<int>(TimeEnum::Count)>    mCustomTimers;
+    std::shared_ptr<internal::SignaledStack>                                   mSignaledStack;
+    std::array<std::vector<internal::SignaledNode*>, UpdateQueueCount>         mReadyBuckets;
 };
 
 // Handle functions
@@ -685,6 +743,122 @@ void WaitBP<UpdateEnum, TimeEnum>::Resume()
     mExeIter.reset();
     mHandle.resume();
 }
+
+// CallbackBP: An awaiter that suspends until an external signal is received.
+// The signal (Send) can be called from any thread, lock-free.
+// The coroutine resumes on the next matching Scheduler::Update().
+//
+// Thread-safety protocol uses a phase-based CAS on a single atomic:
+//   - await_suspend tries CAS Init → Suspended
+//   - Send() tries CAS Init → Signaled
+//   The CAS loser (second to arrive) pushes the SignaledNode into the scheduler's
+//   lock-free stack. This ensures exactly one push with no polling or locking.
+//
+template <internal::CountEnum UpdateEnum, internal::CountEnum TimeEnum, typename T>
+class CallbackBP
+{
+public:
+    using Sender = internal::Sender<T>;
+
+    explicit CallbackBP(UpdateEnum updateType = internal::GetEnumDefault<UpdateEnum>(),
+                        TimeEnum   timeType   = internal::GetEnumDefault<TimeEnum>())
+        : mState(std::make_shared<internal::CallbackSharedState<T>>()),
+          mUpdateType(updateType),
+          mTimeType(timeType)
+    {
+    }
+
+    ~CallbackBP()
+    {
+        if (!mState)
+            return;
+
+        // Try CAS Init → Cancelled. If we win, Send() can never push.
+        auto expected = internal::CallbackPhase::Init;
+        if (mState->phase.compare_exchange_strong(
+                expected, internal::CallbackPhase::Cancelled,
+                std::memory_order_seq_cst,
+                std::memory_order_seq_cst))
+        {
+            return;
+        }
+
+        // We lost. If Send() already signaled (phase == Signaled), a node may be or will
+        // be pushed. If phase == Suspended, that means we're the coroutine being destroyed
+        // while suspended — Send() may later push. In either case, mark cancelled so
+        // Update() skips the resume.
+        if (expected == internal::CallbackPhase::Suspended ||
+            expected == internal::CallbackPhase::Signaled)
+        {
+            mState->cancelled.store(true, std::memory_order_release);
+        }
+    }
+
+    CallbackBP(const CallbackBP&)            = delete;
+    CallbackBP& operator=(const CallbackBP&) = delete;
+    CallbackBP(CallbackBP&&)                 = default;
+    CallbackBP& operator=(CallbackBP&&)      = default;
+
+    Sender GetSender() const
+    {
+        return Sender{mState};
+    }
+
+    // Awaiter interface
+    //
+    bool await_ready() const noexcept
+    {
+        // If Send() already ran (phase >= Signaled), no need to suspend.
+        return mState->phase.load(std::memory_order_seq_cst) == internal::CallbackPhase::Signaled;
+    }
+
+    template <typename U>
+    void await_suspend(std::coroutine_handle<internal::Promise<U>> handle) noexcept
+    {
+        auto h = std::coroutine_handle<internal::PromiseBase>::from_address(handle.address());
+
+        // Set up shared state so Send() can push a node.
+        mState->handle     = h;
+        auto* coroMgr      = h.promise().GetCoroManager();
+        auto* scheduler    = static_cast<SchedulerBP<UpdateEnum, TimeEnum>*>(coroMgr);
+        mState->queueIndex = scheduler->TypesToIndex(mUpdateType, mTimeType);
+        mState->stack      = scheduler->GetSignaledStack();
+
+        // Try CAS Init → Suspended.
+        auto expected = internal::CallbackPhase::Init;
+        if (mState->phase.compare_exchange_strong(
+                expected, internal::CallbackPhase::Suspended,
+                std::memory_order_seq_cst,
+                std::memory_order_seq_cst))
+        {
+            // We won: suspended before Send(). Send() will push when it arrives.
+            return;
+        }
+
+        // We lost: Send() already set Signaled. We're the second to arrive — push the node.
+        if (expected == internal::CallbackPhase::Signaled)
+        {
+            auto* node = new internal::SignaledNode{mState, mState->handle, mState->queueIndex, nullptr};
+            mState->stack->Push(node);
+        }
+    }
+
+    T await_resume()
+        requires(!std::is_void_v<T>)
+    {
+        return std::move(mState->value);
+    }
+
+    void await_resume()
+        requires(std::is_void_v<T>)
+    {
+    }
+
+private:
+    std::shared_ptr<internal::CallbackSharedState<T>> mState;
+    UpdateEnum                                        mUpdateType;
+    TimeEnum                                          mTimeType;
+};
 
 //  Awaiter for All: waits all, returns tuple<T1, T2, T3 ...>
 //
@@ -882,5 +1056,8 @@ using Scheduler       = SchedulerBP<internal::PresetUpdateType, internal::Preset
 using Wait            = WaitBP<internal::PresetUpdateType, internal::PresetTimeType>;
 inline auto WaitUntil = WaitUntilBP<internal::PresetUpdateType, internal::PresetTimeType>;
 inline auto WaitWhile = WaitWhileBP<internal::PresetUpdateType, internal::PresetTimeType>;
+
+template <typename T = void>
+using Callback = CallbackBP<internal::PresetUpdateType, internal::PresetTimeType, T>;
 
 } // namespace tokoro
