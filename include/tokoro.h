@@ -234,8 +234,12 @@ public:
         // Cache the input function and parameters into a lambda to avoid the famous C++ coroutine pitfall.
         // https://devblogs.microsoft.com/oldnewthing/20211103-00/?p=105870
         // <A capturing lambda can be a coroutine, but you have to save your captures while you still can>
-        newEntry.lambda = [task = std::forward<AsyncFunc>(func), tup = std::make_tuple(std::forward<Args>(funcArgs)...)]() mutable {
-            return std::apply(task, tup);
+        // Use shared_ptr wrappers so the lambda is copyable for std::function, while the captured
+        // arguments (e.g. unique_ptr) may be move-only.
+        auto sharedTask = std::make_shared<std::decay_t<AsyncFunc>>(std::forward<AsyncFunc>(func));
+        auto sharedTup  = std::make_shared<std::tuple<std::decay_t<Args>...>>(std::forward<Args>(funcArgs)...);
+        newEntry.lambda = [sharedTask, sharedTup]() mutable -> TmplAny<Async> {
+            return std::apply(*sharedTask, std::move(*sharedTup));
         };
 
         // Create the Coro<T>
